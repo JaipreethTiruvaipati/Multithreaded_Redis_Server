@@ -146,6 +146,73 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 			s.KVMu.Unlock()
 			writer.Write(Value{Typ: "bulk", Str: valStr})
+		
+		} else if command == "LRANGE" {
+			// ==========================================
+			// LOGIC: List Range
+			// ==========================================
+			if len(args) < 3 {
+				writer.Write(Value{Typ: "error", Str: "ERR wrong number of arguments for 'lrange' command"})
+				continue
+			}
+
+			key := args[0].Str
+			start, err1 := strconv.Atoi(args[1].Str)
+			end, err2 := strconv.Atoi(args[2].Str)
+
+			if err1 != nil || err2 != nil {
+				writer.Write(Value{Typ: "error", Str: "ERR value is not an integer or out of range"})
+				continue
+			}
+
+			// Use Read Lock (RLock) since we are only reading data
+			s.KVMu.RLock()
+			entry, exists := s.KV[key]
+			
+			// Case 1: Key does not exist -> Return empty array
+			if !exists {
+				s.KVMu.RUnlock()
+				writer.Write(Value{Typ: "array", Array: []Value{}})
+				continue
+			}
+
+			// Case 2: Wrong Type check
+			val, ok := entry.Value.([]string)
+			if !ok {
+				s.KVMu.RUnlock()
+				writer.Write(Value{Typ: "error", Str: "WRONGTYPE Operation against a key holding the wrong kind of value"})
+				continue
+			}
+
+			// Case 3: Handle Indices Logic
+			length := len(val)
+			
+			// Redis Rules:
+			// 1. If start is negative, treat as 0 (for this stage)
+			if start < 0 { start = 0 }
+			
+			// 2. If end >= length, treat as last element
+			if end >= length { end = length - 1 }
+
+			// 3. If start > end or start is out of bounds, return empty
+			if start > end || start >= length {
+				s.KVMu.RUnlock()
+				writer.Write(Value{Typ: "array", Array: []Value{}})
+				continue
+			}
+
+			// Slice the list
+			// Go slicing [start:limit] is exclusive at the limit, so we use end+1
+			rawSlice := val[start : end+1]
+
+			// Convert []string to []Value for the response
+			respArray := make([]Value, len(rawSlice))
+			for i, s := range rawSlice {
+				respArray[i] = Value{Typ: "bulk", Str: s}
+			}
+
+			s.KVMu.RUnlock()
+			writer.Write(Value{Typ: "array", Array: respArray})
 		}
 	}
 }

@@ -112,24 +112,39 @@ type Writer struct {
 func NewWriter(w io.Writer) *Writer {
 	return &Writer{writer: w}
 }
-
 func (w *Writer) Write(v Value) error {
 	var bytes []byte
-	
-	// Protocol Formatting Logic
+
 	switch v.Typ {
+	case "array":
+		// <--- NEW: Handle Array Writing
+		// Format: *<length>\r\n...elements...
+		bytes = []byte("*" + strconv.Itoa(len(v.Array)) + "\r\n")
+		if _, err := w.writer.Write(bytes); err != nil {
+			return err
+		}
+		// Recursively write each element in the array
+		for _, val := range v.Array {
+			if err := w.Write(val); err != nil {
+				return err
+			}
+		}
+		return nil // Return early because we handled the writing manually above
+
 	case "string":
-		bytes = []byte("+" + v.Str + "\r\n") // Simple String
+		bytes = []byte("+" + v.Str + "\r\n")
 	case "bulk":
-		bytes = []byte("$" + strconv.Itoa(len(v.Str)) + "\r\n" + v.Str + "\r\n") // Bulk String
+		bytes = []byte("$" + strconv.Itoa(len(v.Str)) + "\r\n" + v.Str + "\r\n")
 	case "null":
-		bytes = []byte("$-1\r\n") // Null Bulk String
+		bytes = []byte("$-1\r\n")
 	case "error":
-		bytes = []byte("-" + v.Str + "\r\n") // Error
-	case "int": 
-		bytes = []byte(":" + strconv.Itoa(v.Num) + "\r\n") // Integer (New for Lists)
+		bytes = []byte("-" + v.Str + "\r\n")
+	case "int":
+		bytes = []byte(":" + strconv.Itoa(v.Num) + "\r\n")
+	default:
+		return fmt.Errorf("unknown type: %v", v.Typ)
 	}
-	
+
 	_, err := w.writer.Write(bytes)
 	return err
 }
