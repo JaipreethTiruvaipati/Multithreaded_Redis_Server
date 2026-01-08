@@ -333,6 +333,41 @@ func (s *Server) handleConnection(conn net.Conn) {
 	
 				// Return the new length
 				writer.Write(Value{Typ: "int", Num: len(list)})
-	}
+	} else if command == "LLEN" {
+		// ==========================================
+		// LOGIC: List Length
+		// ==========================================
+		if len(args) < 1 {
+			writer.Write(Value{Typ: "error", Str: "ERR wrong number of arguments for 'llen' command"})
+			continue
+		}
+
+		key := args[0].Str
+
+		// Use Read Lock (RLock) for high concurrency
+		s.KVMu.RLock()
+		entry, exists := s.KV[key]
+
+		// Case 1: Key does not exist -> Return 0
+		if !exists {
+			s.KVMu.RUnlock()
+			writer.Write(Value{Typ: "int", Num: 0})
+			continue
+		}
+
+		// Case 2: Wrong Type Check
+		list, ok := entry.Value.([]string)
+		if !ok {
+			s.KVMu.RUnlock()
+			writer.Write(Value{Typ: "error", Str: "WRONGTYPE Operation against a key holding the wrong kind of value"})
+			continue
+		}
+
+		// Case 3: Return Length
+		length := len(list)
+		s.KVMu.RUnlock()
+
+		writer.Write(Value{Typ: "int", Num: length})
   }  
+}
 }	
