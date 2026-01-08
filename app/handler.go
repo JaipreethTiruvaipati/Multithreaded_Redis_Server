@@ -368,6 +368,55 @@ func (s *Server) handleConnection(conn net.Conn) {
 		s.KVMu.RUnlock()
 
 		writer.Write(Value{Typ: "int", Num: length})
-  }  
+		} else if command == "LPOP" {
+			// ==========================================
+			// LOGIC: Left Pop (Remove First Element)
+			// ==========================================
+			if len(args) < 1 {
+				writer.Write(Value{Typ: "error", Str: "ERR wrong number of arguments for 'lpop' command"})
+				continue
+			}
+
+			key := args[0].Str
+
+			// CRITICAL SECTION: Write Lock (Modifying data)
+			s.KVMu.Lock()
+			entry, exists := s.KV[key]
+
+			// Case 1: Key does not exist -> Return Null
+			if !exists {
+				s.KVMu.Unlock()
+				writer.Write(Value{Typ: "null"})
+				continue
+			}
+
+			// Case 2: Wrong Type Check
+			list, ok := entry.Value.([]string)
+			if !ok {
+				s.KVMu.Unlock()
+				writer.Write(Value{Typ: "error", Str: "WRONGTYPE Operation against a key holding the wrong kind of value"})
+				continue
+			}
+
+			// Case 3: List is empty -> Return Null
+			if len(list) == 0 {
+				// Optional: Delete empty key to save memory
+				delete(s.KV, key)
+				s.KVMu.Unlock()
+				writer.Write(Value{Typ: "null"})
+				continue
+			}
+
+			// Case 4: Pop the element
+			element := list[0]       // Get head
+			newList := list[1:]      // Reslice to remove head
+
+			// Update the store
+			s.KV[key] = Entry{Value: newList, Expiry: entry.Expiry}
+			s.KVMu.Unlock()
+
+			// Return the popped element
+			writer.Write(Value{Typ: "bulk", Str: element})
+	}
 }
 }	
