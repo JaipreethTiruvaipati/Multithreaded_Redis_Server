@@ -368,9 +368,9 @@ func (s *Server) handleConnection(conn net.Conn) {
 		s.KVMu.RUnlock()
 
 		writer.Write(Value{Typ: "int", Num: length})
-		} else if command == "LPOP" {
+		}  else if command == "LPOP" {
 			// ==========================================
-			// LOGIC: Left Pop (Remove First Element)
+			// LOGIC: Left Pop (Single or Multiple)
 			// ==========================================
 			if len(args) < 1 {
 				writer.Write(Value{Typ: "error", Str: "ERR wrong number of arguments for 'lpop' command"})
@@ -378,15 +378,34 @@ func (s *Server) handleConnection(conn net.Conn) {
 			}
 
 			key := args[0].Str
+			count := 1
+			hasCountArg := false
 
-			// CRITICAL SECTION: Write Lock (Modifying data)
+			// 1. Check for Optional Count Argument
+			if len(args) > 1 {
+				c, err := strconv.Atoi(args[1].Str)
+				if err != nil || c < 0 {
+					writer.Write(Value{Typ: "error", Str: "ERR value is not an integer or out of range"})
+					continue
+				}
+				count = c
+				hasCountArg = true
+			}
+
+			// CRITICAL SECTION: Write Lock
 			s.KVMu.Lock()
 			entry, exists := s.KV[key]
 
-			// Case 1: Key does not exist -> Return Null
+			// Case 1: Key does not exist
 			if !exists {
 				s.KVMu.Unlock()
-				writer.Write(Value{Typ: "null"})
+				if hasCountArg {
+					// LPOP key count -> Returns Empty Array if missing
+					writer.Write(Value{Typ: "array", Array: []Value{}})
+				} else {
+					// LPOP key -> Returns Null if missing
+					writer.Write(Value{Typ: "null"})
+				}
 				continue
 			}
 
@@ -398,25 +417,43 @@ func (s *Server) handleConnection(conn net.Conn) {
 				continue
 			}
 
-			// Case 3: List is empty -> Return Null
-			if len(list) == 0 {
-				// Optional: Delete empty key to save memory
-				delete(s.KV, key)
-				s.KVMu.Unlock()
-				writer.Write(Value{Typ: "null"})
-				continue
+			// Case 3: Calculate actual number to pop
+			// If count > length, we just pop the whole list
+			if count > len(list) {
+				count = len(list)
 			}
 
-			// Case 4: Pop the element
-			element := list[0]       // Get head
-			newList := list[1:]      // Reslice to remove head
+			// Perform the Pop
+			// Go Slicing: list[:count] gives the first 'count' elements
+			poppedElements := list[:count]
+			newList := list[count:]
 
-			// Update the store
-			s.KV[key] = Entry{Value: newList, Expiry: entry.Expiry}
+			// Update Store
+			// If list is empty now, we usually delete the key, but updating it to empty slice is also fine for this stage
+			if len(newList) == 0 {
+				delete(s.KV, key)
+			} else {
+				s.KV[key] = Entry{Value: newList, Expiry: entry.Expiry}
+			}
+			
 			s.KVMu.Unlock()
 
-			// Return the popped element
-			writer.Write(Value{Typ: "bulk", Str: element})
-	}
+			// Case 4: Formulate Response
+			if hasCountArg {
+				// Return Array (even if count is 1)
+				values := make([]Value, len(poppedElements))
+				for i, v := range poppedElements {
+					values[i] = Value{Typ: "bulk", Str: v}
+				}
+				writer.Write(Value{Typ: "array", Array: values})
+			} else {
+				// Return Single Bulk String
+				if len(poppedElements) == 0 {
+					writer.Write(Value{Typ: "null"})
+				} else {
+					writer.Write(Value{Typ: "bulk", Str: poppedElements[0]})
+				}
+			}
+		}
 }
 }	
