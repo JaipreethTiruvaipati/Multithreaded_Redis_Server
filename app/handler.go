@@ -288,6 +288,51 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 			s.KVMu.RUnlock()
 			writer.Write(Value{Typ: "array", Array: respArray})
-		}
+			} else if command == "LPUSH" {
+				// ==========================================
+				// LOGIC: Left Push (Prepend)
+				// ==========================================
+				if len(args) < 2 {
+					writer.Write(Value{Typ: "error", Str: "ERR wrong number of arguments for 'lpush' command"})
+					continue
+				}
+	
+				key := args[0].Str
+	
+				// CRITICAL SECTION: Lock once for the whole batch
+				s.KVMu.Lock()
+	
+				entry, exists := s.KV[key]
+	
+				var list []string
+				if !exists {
+					list = []string{}
+				} else {
+					existingList, ok := entry.Value.([]string)
+					if !ok {
+						s.KVMu.Unlock()
+						writer.Write(Value{Typ: "error", Str: "WRONGTYPE Operation against a key holding the wrong kind of value"})
+						continue
+					}
+					list = existingList
+				}
+	
+				// LOOP: Iterate through args and Prepend them one by one.
+				// Example: LPUSH key A B C
+				// 1. Prepend A -> [A, ...]
+				// 2. Prepend B -> [B, A, ...]
+				// 3. Prepend C -> [C, B, A, ...]
+				for _, arg := range args[1:] {
+					// Go Idiom for Prepend: append(new_item_slice, old_list...)
+					list = append([]string{arg.Str}, list...)
+				}
+	
+				// Update Store
+				s.KV[key] = Entry{Value: list, Expiry: entry.Expiry}
+				s.KVMu.Unlock()
+	
+				// Return the new length
+				writer.Write(Value{Typ: "int", Num: len(list)})
 	}
-}
+  }  
+}	
