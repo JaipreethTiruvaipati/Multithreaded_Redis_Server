@@ -80,75 +80,68 @@ func (s *Server) handleConnection(conn net.Conn) {
 			}
 
 		} else if command == "RPUSH" {
-			// ============================================================
-			// COMMAND: RPUSH key element [element ...]
-			// Append one or more values to a list.
-			// ============================================================
-			
-			// VALIDATION: Check if we have at least a key and one value.
-			if len(args) < 2 {
-				writer.Write(Value{Typ: "error", Str: "ERR wrong number of arguments for 'rpush' command"})
-				continue
-			}
-
-			key := args[0].Str
-
-			// CONCURRENCY CONTROL: Write Lock (Lock)
-			// We use Lock() because we are MODIFYING the state (appending to list).
-			// This pauses all other readers/writers for this map.
-			s.KVMu.Lock()
-
-			// Check if key already exists in the store.
-			entry, exists := s.KV[key]
-
-			var list []string
-			if !exists {
-				// CASE A: New List. Create an empty slice.
-				list = []string{}
-			} else {
-				// CASE B: Existing Key. Check Type.
-				// GO SPECIFIC: Type Assertion. We must verify the interface{} holds a []string.
-				existingList, ok := entry.Value.([]string)
-				if !ok {
-					// Error: The key exists but holds a String (from SET), not a List.
-					s.KVMu.Unlock() // CRITICAL: Always release lock before returning!
-					writer.Write(Value{Typ: "error", Str: "WRONGTYPE Operation against a key holding the wrong kind of value"})
+				// ==========================================
+				// LOGIC: Right Push (Append) with Blocking Support
+				// ==========================================
+				
+				// VALIDATION: Ensure at least one value is provided
+				if len(args) < 2 {
+					writer.Write(Value{Typ: "error", Str: "ERR wrong number of arguments for 'rpush' command"})
 					continue
 				}
-				list = existingList
-			}
-
-			// Inside RPUSH logic...
-        // ... (Lock KVMu, check type, etc.) ...
-
-			// OLD LOOP:
-			// for _, arg := range args[1:] {
-			//     list = append(list, arg.Str)
-			// }
-
-			// NEW LOOP: Event-Driven Logic
-			for _, arg := range args[1:] {
-				// 1. Check if anyone is waiting for this key
-				// If dispatch returns true, the value goes directly to the waiting client.
-				// It effectively "skips" the database storage.
-				if s.dispatch(key, arg.Str) {
-					continue 
+	
+				key := args[0].Str
+	
+				// CRITICAL SECTION: Lock the map for writing.
+				// This prevents other goroutines (clients) from modifying the list while we work.
+				s.KVMu.Lock()
+	
+				// Check if the key already exists in our storage
+				entry, exists := s.KV[key]
+	
+				var list []string
+				if !exists {
+					// Case A: Key is new, start with an empty list
+					list = []string{}
+				} else {
+					// Case B: Key exists, verify it is actually a List ([]string)
+					existingList, ok := entry.Value.([]string)
+					if !ok {
+						// Error: The key holds a String (from SET), we cannot push to it.
+						s.KVMu.Unlock()
+						writer.Write(Value{Typ: "error", Str: "WRONGTYPE Operation against a key holding the wrong kind of value"})
+						continue
+					}
+					list = existingList
 				}
-
-				// 2. If no one is waiting, append to list normally
-				list = append(list, arg.Str)
-			}
-
-			// Update the store with the new list.
-			// We preserve the old Expiry time (if any).
-			s.KV[key] = Entry{Value: list, Expiry: entry.Expiry}
-			
-			// Release the lock immediately after the critical section is done.
-			s.KVMu.Unlock()
-
-			// RESP PROTOCOL: Return the new length of the list as an Integer.
-			writer.Write(Value{Typ: "int", Num: len(list)})
-
+	
+				// --- NEW LOGIC: Dispatch Tracking ---
+				dCount := 0 // Counter for items sent directly to waiting clients (BLPOP)
+	
+				// Iterate through all values provided in the command (e.g., RPUSH key val1 val2)
+				for _, arg := range args[1:] {
+					
+					// Check if a client is blocked waiting for this key (BLPOP).
+					// s.dispatch returns true if the value was successfully sent to a waiting client.
+					if s.dispatch(key, arg.Str) {
+						dCount++ // Increment count because this item was processed (just not stored)
+						continue // Skip the append! The item is gone, consumed by the other client.
+					}
+	
+					// If no one is waiting, append the value to the list storage normally.
+					list = append(list, arg.Str)
+				}
+	
+				// Save the updated list back to the storage map
+				s.KV[key] = Entry{Value: list, Expiry: entry.Expiry}
+				
+				// Release the lock so other clients can access the map
+				s.KVMu.Unlock()
+	
+				// RETURN VALUE FIX:
+				// Redis expects us to return the total number of elements added/processed.
+				// We return: (Items currently in DB) + (Items dispatched immediately to BLPOP)
+				writer.Write(Value{Typ: "int", Num: len(list) + dCount})
 		} else if command == "SET" {
 			// ============================================================
 			// COMMAND: SET key value [PX milliseconds]
@@ -328,10 +321,12 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 			s.KVMu.RUnlock()
 			writer.Write(Value{Typ: "array", Array: respArray})
-			} else if command == "LPUSH" {
+		} else if command == "LPUSH" {
 				// ==========================================
-				// LOGIC: Left Push (Prepend)
+				// LOGIC: Left Push (Prepend) with Blocking Support
 				// ==========================================
+	
+				// VALIDATION: Ensure at least one value is provided
 				if len(args) < 2 {
 					writer.Write(Value{Typ: "error", Str: "ERR wrong number of arguments for 'lpush' command"})
 					continue
@@ -339,15 +334,17 @@ func (s *Server) handleConnection(conn net.Conn) {
 	
 				key := args[0].Str
 	
-				// CRITICAL SECTION: Lock once for the whole batch
+				// CRITICAL SECTION: Lock the map for writing
 				s.KVMu.Lock()
 	
 				entry, exists := s.KV[key]
 	
 				var list []string
 				if !exists {
+					// Case A: Key is new, start with an empty list
 					list = []string{}
 				} else {
+					// Case B: Key exists, verify it is a List
 					existingList, ok := entry.Value.([]string)
 					if !ok {
 						s.KVMu.Unlock()
@@ -357,35 +354,33 @@ func (s *Server) handleConnection(conn net.Conn) {
 					list = existingList
 				}
 	
-				// LOOP: Iterate through args and Prepend them one by one.
-				// Example: LPUSH key A B C
-				// 1. Prepend A -> [A, ...]
-				// 2. Prepend B -> [B, A, ...]
-				// 3. Prepend C -> [C, B, A, ...]
-				// --- CHANGED LOGIC START ---
-			
-			// Iterate through all arguments (e.g., LPUSH key val1 val2)
-			for _, arg := range args[1:] {
-				
-				// 1. Check for waiting clients (BLPOP)
-				// If dispatch returns true, the value was hijacked by a waiting client.
-				if s.dispatch(key, arg.Str) {
-					continue // Skip adding to the list!
-				}
-
-				// 2. If no one is waiting, prepend to the list normally
-				// append([]string{val}, list...) creates a new slice with val at the front
-				list = append([]string{arg.Str}, list...)
-			}
-			
-			// --- CHANGED LOGIC END ---
+				// --- NEW LOGIC: Dispatch Tracking ---
+				dCount := 0 // Counter for items sent directly to waiting clients (BLPOP)
 	
-				// Update Store
+				// Iterate through all values provided
+				for _, arg := range args[1:] {
+					
+					// Check if a client is blocked waiting for this key (BLPOP).
+					// s.dispatch sends the value directly to them via channel.
+					if s.dispatch(key, arg.Str) {
+						dCount++ // Increment count because this item was processed
+						continue // Skip adding to the list
+					}
+	
+					// If no one is waiting, prepend to the list.
+					// Go Idiom: append new item to front -> append([]Type{new}, old...)
+					list = append([]string{arg.Str}, list...)
+				}
+	
+				// Save the updated list back to storage
 				s.KV[key] = Entry{Value: list, Expiry: entry.Expiry}
+				
+				// Release the lock
 				s.KVMu.Unlock()
 	
-				// Return the new length
-				writer.Write(Value{Typ: "int", Num: len(list)})
+				// RETURN VALUE FIX:
+				// Return sum of stored items + dispatched items to satisfy the test expectation
+				writer.Write(Value{Typ: "int", Num: len(list) + dCount})
 	} else if command == "LLEN" {
 		// ==========================================
 		// LOGIC: List Length
@@ -507,7 +502,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 					writer.Write(Value{Typ: "bulk", Str: poppedElements[0]})
 				}
 			}
-			} else if command == "BLPOP" {
+		} else if command == "BLPOP" {
 				// ==========================================
 				// LOGIC: Blocking Pop
 				// ==========================================
