@@ -502,30 +502,26 @@ func (s *Server) handleConnection(conn net.Conn) {
 					writer.Write(Value{Typ: "bulk", Str: poppedElements[0]})
 				}
 			}
-		} else if command == "BLPOP" {
+			} else if command == "BLPOP" {
 				// ==========================================
-				// LOGIC: Blocking Pop
+				// LOGIC: Blocking Pop (With Timeout Fix)
 				// ==========================================
-				// args format: [key1, timeout] (Simplifying to single key for now)
 				if len(args) < 2 {
 					writer.Write(Value{Typ: "error", Str: "ERR wrong number of arguments for 'blpop' command"})
 					continue
 				}
 	
 				key := args[0].Str
-				timeoutStr := args[len(args)-1].Str // Last arg is always timeout
+				timeoutStr := args[len(args)-1].Str
 				timeoutSec, err := strconv.ParseFloat(timeoutStr, 64)
 				if err != nil {
 					writer.Write(Value{Typ: "error", Str: "ERR timeout is not a float or out of range"})
 					continue
 				}
 	
-				// Phase 1: Try Non-Blocking Pop First
+				// Phase 1: Non-Blocking check (Try to pop immediately)
 				s.KVMu.Lock()
-				// (Simple implementation: check single key. Real Redis loops all keys)
 				entry, exists := s.KV[key]
-				
-				// If data exists, pop immediately (Act like LPOP)
 				if exists {
 					list, ok := entry.Value.([]string)
 					if ok && len(list) > 0 {
@@ -538,7 +534,6 @@ func (s *Server) handleConnection(conn net.Conn) {
 						}
 						s.KVMu.Unlock()
 	
-						// Return Array: [key, value]
 						writer.Write(Value{Typ: "array", Array: []Value{
 							{Typ: "bulk", Str: key},
 							{Typ: "bulk", Str: val},
@@ -549,34 +544,31 @@ func (s *Server) handleConnection(conn net.Conn) {
 				s.KVMu.Unlock()
 	
 				// Phase 2: Block (Wait)
-				// Create a channel to wait on
 				resultCh := make(chan []string)
 				
-				// Register ourselves
 				s.BlockedMu.Lock()
 				s.BlockedClients[key] = append(s.BlockedClients[key], &BlockedClient{Ch: resultCh})
 				s.BlockedMu.Unlock()
 	
-				// Calculate timeout channel
+				// --- TIMEOUT CALCULATION FIX ---
 				var timeoutCh <-chan time.Time
 				if timeoutSec > 0 {
-					timeoutCh = time.After(time.Duration(timeoutSec) * time.Second)
+					// Convert float seconds (0.1) to Duration correctly
+					timeoutCh = time.After(time.Duration(timeoutSec * float64(time.Second)))
 				}
-				// If timeout is 0, timeoutCh remains nil (blocks forever, which is what we want)
+				// -------------------------------
 	
-				// Wait for event OR timeout
 				select {
 				case res := <-resultCh:
-					// Wake up! We got data from RPUSH
+					// Event Triggered (Data received from RPUSH)
 					writer.Write(Value{Typ: "array", Array: []Value{
-						{Typ: "bulk", Str: res[0]}, // Key
-						{Typ: "bulk", Str: res[1]}, // Value
+						{Typ: "bulk", Str: res[0]},
+						{Typ: "bulk", Str: res[1]},
 					}})
 				case <-timeoutCh:
-					// Timed out. Remove ourselves from the list.
+					// Timeout Triggered (Remove ourselves from list)
 					s.BlockedMu.Lock()
 					clients := s.BlockedClients[key]
-					// Filter out our channel
 					var remaining []*BlockedClient
 					for _, c := range clients {
 						if c.Ch != resultCh {
@@ -586,7 +578,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 					s.BlockedClients[key] = remaining
 					s.BlockedMu.Unlock()
 	
-					// Return Null Array
+					// Return Null Array (*-1\r\n)
 					writer.Write(Value{Typ: "null_array"})
 				}
 			}
