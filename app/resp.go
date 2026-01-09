@@ -139,6 +139,8 @@ func (w *Writer) Write(v Value) error {
 		bytes = []byte("$-1\r\n")
 	case "error":
 		bytes = []byte("-" + v.Str + "\r\n")
+	case "null_array":  // <--- ADD THIS CASE
+        bytes = []byte("*-1\r\n") // Null Array (for BLPOP timeout)
 	case "int":
 		bytes = []byte(":" + strconv.Itoa(v.Num) + "\r\n")
 	default:

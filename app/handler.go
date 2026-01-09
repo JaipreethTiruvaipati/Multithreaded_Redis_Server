@@ -6,7 +6,33 @@ import (
 	"strings"
 	"time"
 )
+// Helper to check if any client is blocked on this key.
+// Returns true if the value was sent to a waiting client (hijacked).
+func (s *Server) dispatch(key string, value string) bool {
+	s.BlockedMu.Lock()
+	defer s.BlockedMu.Unlock()
 
+	// Check if anyone is waiting
+	clients, ok := s.BlockedClients[key]
+	if !ok || len(clients) == 0 {
+		return false // No waiters
+	}
+
+	// FIFO: Wake up the first client in line
+	client := clients[0]
+	
+	// Update the list (remove the first client)
+	s.BlockedClients[key] = clients[1:]
+	if len(s.BlockedClients[key]) == 0 {
+		delete(s.BlockedClients, key)
+	}
+
+	// Send data to the client's channel
+	// We send [key, value] because BLPOP response includes the key name
+	client.Ch <- []string{key, value}
+	
+	return true // Data was consumed!
+}
 // handleConnection manages the lifecycle of a single client connection.
 // SYSTEM DESIGN: This runs in its own Goroutine (Lightweight Thread), 
 // allowing the server to handle thousands of concurrent clients.
@@ -92,10 +118,24 @@ func (s *Server) handleConnection(conn net.Conn) {
 				list = existingList
 			}
 
-			// OPTIMIZATION: Batch Processing
-			// Iterate through ALL provided arguments and append them.
-			// We do this while holding the lock ONCE, reducing lock contention overhead.
+			// Inside RPUSH logic...
+        // ... (Lock KVMu, check type, etc.) ...
+
+			// OLD LOOP:
+			// for _, arg := range args[1:] {
+			//     list = append(list, arg.Str)
+			// }
+
+			// NEW LOOP: Event-Driven Logic
 			for _, arg := range args[1:] {
+				// 1. Check if anyone is waiting for this key
+				// If dispatch returns true, the value goes directly to the waiting client.
+				// It effectively "skips" the database storage.
+				if s.dispatch(key, arg.Str) {
+					continue 
+				}
+
+				// 2. If no one is waiting, append to list normally
 				list = append(list, arg.Str)
 			}
 
@@ -322,10 +362,23 @@ func (s *Server) handleConnection(conn net.Conn) {
 				// 1. Prepend A -> [A, ...]
 				// 2. Prepend B -> [B, A, ...]
 				// 3. Prepend C -> [C, B, A, ...]
-				for _, arg := range args[1:] {
-					// Go Idiom for Prepend: append(new_item_slice, old_list...)
-					list = append([]string{arg.Str}, list...)
+				// --- CHANGED LOGIC START ---
+			
+			// Iterate through all arguments (e.g., LPUSH key val1 val2)
+			for _, arg := range args[1:] {
+				
+				// 1. Check for waiting clients (BLPOP)
+				// If dispatch returns true, the value was hijacked by a waiting client.
+				if s.dispatch(key, arg.Str) {
+					continue // Skip adding to the list!
 				}
+
+				// 2. If no one is waiting, prepend to the list normally
+				// append([]string{val}, list...) creates a new slice with val at the front
+				list = append([]string{arg.Str}, list...)
+			}
+			
+			// --- CHANGED LOGIC END ---
 	
 				// Update Store
 				s.KV[key] = Entry{Value: list, Expiry: entry.Expiry}
@@ -454,6 +507,93 @@ func (s *Server) handleConnection(conn net.Conn) {
 					writer.Write(Value{Typ: "bulk", Str: poppedElements[0]})
 				}
 			}
-		}
+			} else if command == "BLPOP" {
+				// ==========================================
+				// LOGIC: Blocking Pop
+				// ==========================================
+				// args format: [key1, timeout] (Simplifying to single key for now)
+				if len(args) < 2 {
+					writer.Write(Value{Typ: "error", Str: "ERR wrong number of arguments for 'blpop' command"})
+					continue
+				}
+	
+				key := args[0].Str
+				timeoutStr := args[len(args)-1].Str // Last arg is always timeout
+				timeoutSec, err := strconv.ParseFloat(timeoutStr, 64)
+				if err != nil {
+					writer.Write(Value{Typ: "error", Str: "ERR timeout is not a float or out of range"})
+					continue
+				}
+	
+				// Phase 1: Try Non-Blocking Pop First
+				s.KVMu.Lock()
+				// (Simple implementation: check single key. Real Redis loops all keys)
+				entry, exists := s.KV[key]
+				
+				// If data exists, pop immediately (Act like LPOP)
+				if exists {
+					list, ok := entry.Value.([]string)
+					if ok && len(list) > 0 {
+						val := list[0]
+						newList := list[1:]
+						if len(newList) == 0 {
+							delete(s.KV, key)
+						} else {
+							s.KV[key] = Entry{Value: newList, Expiry: entry.Expiry}
+						}
+						s.KVMu.Unlock()
+	
+						// Return Array: [key, value]
+						writer.Write(Value{Typ: "array", Array: []Value{
+							{Typ: "bulk", Str: key},
+							{Typ: "bulk", Str: val},
+						}})
+						continue
+					}
+				}
+				s.KVMu.Unlock()
+	
+				// Phase 2: Block (Wait)
+				// Create a channel to wait on
+				resultCh := make(chan []string)
+				
+				// Register ourselves
+				s.BlockedMu.Lock()
+				s.BlockedClients[key] = append(s.BlockedClients[key], &BlockedClient{Ch: resultCh})
+				s.BlockedMu.Unlock()
+	
+				// Calculate timeout channel
+				var timeoutCh <-chan time.Time
+				if timeoutSec > 0 {
+					timeoutCh = time.After(time.Duration(timeoutSec) * time.Second)
+				}
+				// If timeout is 0, timeoutCh remains nil (blocks forever, which is what we want)
+	
+				// Wait for event OR timeout
+				select {
+				case res := <-resultCh:
+					// Wake up! We got data from RPUSH
+					writer.Write(Value{Typ: "array", Array: []Value{
+						{Typ: "bulk", Str: res[0]}, // Key
+						{Typ: "bulk", Str: res[1]}, // Value
+					}})
+				case <-timeoutCh:
+					// Timed out. Remove ourselves from the list.
+					s.BlockedMu.Lock()
+					clients := s.BlockedClients[key]
+					// Filter out our channel
+					var remaining []*BlockedClient
+					for _, c := range clients {
+						if c.Ch != resultCh {
+							remaining = append(remaining, c)
+						}
+					}
+					s.BlockedClients[key] = remaining
+					s.BlockedMu.Unlock()
+	
+					// Return Null Array
+					writer.Write(Value{Typ: "null_array"})
+				}
+			}
 }
 }	

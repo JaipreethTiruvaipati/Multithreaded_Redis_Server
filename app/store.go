@@ -20,6 +20,13 @@ type Entry struct {
 	// Expiry Metadata for TTL (Time To Live).
 	Expiry time.Time
 }
+// SYSTEM DESIGN: Event Listener
+// This struct represents a client waiting for data.
+type BlockedClient struct {
+    // Channel acts as the notification mechanism.
+    // We send the [key, value] pair through this channel when data arrives.
+	Ch chan []string 
+}
 
 // ======================================================================================
 // OOP CONCEPT: Encapsulation
@@ -37,6 +44,10 @@ type Server struct {
 	// Go maps are NOT thread-safe. We use a RWMutex to prevent Race Conditions
 	// when multiple clients try to read/write at the same time.
 	KVMu       sync.RWMutex
+	// NEW: Registry for blocking clients
+    // Map: KeyName -> List of Clients waiting for that key
+	BlockedClients map[string][]*BlockedClient
+	BlockedMu      sync.Mutex // Separate lock for high concurrency
 }
 
 // Constructor Pattern
@@ -44,6 +55,7 @@ func NewServer(listenAddr string) *Server {
 	return &Server{
 		ListenAddr: listenAddr,
 		KV:         make(map[string]Entry), // Initialize map to avoid panic
+		BlockedClients: make(map[string][]*BlockedClient), // Initialize
 	}
 }
 
